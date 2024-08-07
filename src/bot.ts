@@ -9,7 +9,7 @@ const bot = new Telegraf('<YOUR_BOT_TOKEN_HERE>');
 
 bot.telegram.setMyCommands([{ command: '/start', description: 'Начало работы с ботом' }]);
 
-const appName = 'Your App Name Here'
+const appName = 'Your App Name Here';
 const adminIds = ['1234567890']; // Замените на реальные ID администраторов
 const notificationInterval = 1 * 60 * 60 * 1000; // Интервал уведомления администраторов, указан 1 час
 const notificationThreshold = 10; // Количество тикетов для немедленного уведомления
@@ -52,7 +52,7 @@ const notifyAdminsImmediately = async () => {
       return acc;
     }, {} as { [key: string]: number });
 
-    const message = `За последние ${notificationWindow / 1000} секунд было получено ${newTickets.length} новых обращений:\n` +
+    const message = `За последние ${formatDuration(notificationWindow / 1000)} было получено ${newTickets.length} новых обращений:\n` +
                     Object.entries(ticketCounts)
                       .map(([category, count]) => `${category}: ${count}`)
                       .join('\n');
@@ -223,8 +223,6 @@ bot.on('text', async (ctx) => {
         // ticket.status = 'replied';
         // await ticketRepository.save(ticket);
 
-        activeReplies.delete(ctx.from.id);
-        userStates.delete(ctx.from.id); // Сбрасываем состояние
         await ctx.reply('Ответ был отправлен.');
       } else {
         await ctx.reply('Тикет не найден.');
