@@ -1,0 +1,21 @@
+{
+  "name": "tech_support_bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "ts-node src/bot.ts"
+  },
+  "author": "PartyCorn",
+  "license": "MIT",
+  "dependencies": {
+    "sqlite3": "^5.1.7",
+    "telegraf": "^4.16.3",
+    "typeorm": "^0.3.20"
+  },
+  "devDependencies": {
+    "@types/node": "^22.1.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.4"
+  }
+}
