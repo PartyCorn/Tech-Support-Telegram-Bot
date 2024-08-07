@@ -52,7 +52,7 @@ const notifyAdminsImmediately = async () => {
       return acc;
     }, {} as { [key: string]: number });
 
-    const message = `За последние ${formatDuration(notificationWindow / 1000)} было получено ${newTickets.length} новых обращений:\n` +
+    const message = `За последние ${formatDuration(notificationWindow / 1000)} было получено ${getDeclension(newTickets.length, "новое обращение", "новых обращения", "новых обращений")}:\n` +
                     Object.entries(ticketCounts)
                       .map(([category, count]) => `${category}: ${count}`)
                       .join('\n');
