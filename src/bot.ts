@@ -18,8 +18,26 @@ const maximumTicketsPerUser = 2; // Количество активныв тик
 
 let ticketTimestamps: number[] = []; // Массив для хранения временных меток новых тикетов
 const activeReplies = new Map<number, number>(); // Храним ID администратора и тикет
-const userStates = new Map<number, 'creating_ticket' | 'replying_ticket' | null>();
+const userStates = new Map<number, 'creating_ticket' | 'replying_ticket' | `replying_to_admin_${string}` | null>();
 const userCategories = new Map<number, string>(); // Храним категорию для каждого пользователя
+
+function formatTicketMessage(ticket: Ticket): string {
+  const formattedMessages = ticket.messages.map(
+    (msg) => `${new Date(msg.timestamp).toLocaleString('ru-RU')}\n${(msg.sender === 'admin' ? 'Администратор' : 'Пользователь') + ` (${msg.senderName}):`}\n${msg.text}\n`
+  ).join('\n');
+
+  return `Тикет #${ticket.id}\nКатегория: ${ticket.category}\nСообщения:\n\n${formattedMessages}`;
+}
+
+function formatTicketLog(ticket: Ticket) {
+  let log = `Обращение #${ticket.id} (${ticket.category}): ${ticket.messages[0].text}\n\n`;
+
+  ticket.messages.slice(1).forEach(msg => {
+    log += `${new Date(msg.timestamp).toLocaleString('ru-RU')}\n${(msg.sender === 'admin' ? 'Администратор' : 'Пользователь') + ` (${msg.senderName}):`}\n${msg.text}\n\n`;
+  });
+
+  return log;
+}
 
 const addTicketTimestamp = (timestamp: number) => {
   ticketTimestamps.push(timestamp);
@@ -82,7 +100,8 @@ bot.hears(['Идеи и предложения', 'Сообщить об ошиб
 
     if (tickets.length > 0) {
       const ticket = tickets[0]; // Берем первый тикет
-      await ctx.reply(`Тикет #${ticket.id}\nКатегория: ${ticket.category}\nСообщение: ${ticket.message}`, createTicketButtons(ticket.id));
+      const text = formatTicketMessage(ticket);
+      await ctx.reply(text.length < 4096 ? text : 'Сообщение слишком длинное. Пожалуйста, скачайте лог файла.', createTicketButtons(ticket.id));
     } else {
       await ctx.reply('Нет активных тикетов в этой категории.', getCategoryKeyboard());
     }
@@ -92,6 +111,28 @@ bot.hears(['Идеи и предложения', 'Сообщить об ошиб
     userCategories.set(ctx.from.id, category); // Сохраняем категорию
   }
 });
+
+bot.action(/download_ticket_log_(\d+)/, async (ctx) => {
+  const ticketId = parseInt(ctx.match[1], 10);
+  const ticketRepository = AppDataSource.getRepository(Ticket);
+
+  try {
+    const ticket = await ticketRepository.findOne({ where: { id: ticketId } });
+
+    if (ticket) {
+      const logContent = formatTicketLog(ticket);
+      const logBuffer = Buffer.from(logContent, 'utf-8');
+
+      await ctx.replyWithDocument({ source: logBuffer, filename: `ticket_log_${ticketId}.txt` });
+    } else {
+      await ctx.reply('Тикет не найден.');
+    }
+  } catch (error) {
+    await ctx.reply('Произошла ошибка при создании файла лога.');
+    console.error('Ошибка при генерации файла лога:', error);
+  }
+});
+
 
 bot.action(/close_ticket_(\d+)/, async (ctx) => {
   const ticketId = parseInt(ctx.match[1], 10);
@@ -153,13 +194,25 @@ bot.action(/next_ticket_(\d+)/, async (ctx) => {
     
     if (currentTicketIndex >= 0 && currentTicketIndex < tickets.length - 1) {
       const nextTicket = tickets[currentTicketIndex + 1];
-      await ctx.editMessageText(`Тикет #${nextTicket.id}\nКатегория: ${nextTicket.category}\nСообщение: ${nextTicket.message}`, createTicketButtons(nextTicket.id));
+      const text = formatTicketMessage(nextTicket);
+      await ctx.editMessageText(text.length < 4096 ? text : 'Сообщение слишком длинное. Пожалуйста, скачайте лог файла.', createTicketButtons(nextTicket.id));
     } else {
       await ctx.reply('Нет больше тикетов.', getCategoryKeyboard());
     }
   } catch (error) {
     await ctx.reply('Произошла ошибка при получении следующего тикета.');
   }
+  await ctx.answerCbQuery();
+});
+
+bot.action(/cancel_reply_to_admin_(\d+)/, async (ctx) => {
+  const adminId = parseInt(ctx.match[1], 10);
+
+  // Убираем состояние и активный ответ
+  userStates.delete(ctx.from.id);
+  activeReplies.delete(ctx.from.id);
+
+  await ctx.reply('Ответ администратору был отменен.');
   await ctx.answerCbQuery();
 });
 
@@ -185,6 +238,7 @@ bot.on('text', async (ctx) => {
     }
 
     const ticketRepository = AppDataSource.getRepository(Ticket);
+
     const activeTickets = await ticketRepository.count({ where: { userId, status: 'active' } });
 
     if (activeTickets >= maximumTicketsPerUser) {
@@ -195,12 +249,22 @@ bot.on('text', async (ctx) => {
     const ticket = new Ticket();
     ticket.userId = userId;
     ticket.category = category;
-    ticket.message = ctx.message.text;
+    ticket.messages = [];
     ticket.status = 'active';
     ticket.createdAt = new Date();
     ticket.updatedAt = new Date();
 
+    const newMessage = {
+      sender: 'user',
+      senderName: ctx.from.first_name,
+      text: ctx.message.text,
+      timestamp: new Date(),
+    };
+    ticket.messages.push(newMessage);
+    ticket.updatedAt = new Date();
+
     await ticketRepository.save(ticket);
+
     addTicketTimestamp(Date.now());
     checkImmediateNotification();
 
@@ -213,6 +277,7 @@ bot.on('text', async (ctx) => {
     
     const ticketId = activeReplies.get(ctx.from.id);
     const reply = ctx.message.text;
+
     const ticketRepository = AppDataSource.getRepository(Ticket);
 
     try {
@@ -220,10 +285,63 @@ bot.on('text', async (ctx) => {
       if (ticket) {
         await bot.telegram.sendMessage(ticket.userId, `Ответ на ваш тикет #${ticket.id}: ${reply}`);
 
+        const newMessage = {
+          sender: 'admin',
+          senderName: ctx.from.first_name,
+          text: ctx.message.text,
+          timestamp: new Date(),
+        };
+        
+        ticket.messages.push(newMessage);
+        ticket.updatedAt = new Date();
+        await ticketRepository.save(ticket);
+
         // ticket.status = 'replied';
         // await ticketRepository.save(ticket);
 
         await ctx.reply('Ответ был отправлен.');
+
+        activeReplies.delete(ctx.from.id);
+        userStates.delete(ctx.from.id);
+
+        await bot.telegram.sendMessage(
+          ticket.userId, 
+          `Ответ на ваш тикет #${ticket.id}: ${reply}\n\nВы можете ответить администратору, просто напишите сообщение.`, 
+          Markup.inlineKeyboard([
+            Markup.button.callback('Отменить ответ', `cancel_reply_to_admin_${ctx.from.id}`),
+            Markup.button.callback('Закрыть тикет', `close_ticket_${ticket.id}`)
+          ])
+        );
+        userStates.set(+ticket.userId, `replying_to_admin_${ctx.from.id}`);
+      } else {
+        await ctx.reply('Тикет не найден.');
+      }
+    } catch (error) {
+      await ctx.reply('Произошла ошибка при отправке ответа.');
+    }
+  } else if (state && state.startsWith('replying_to_admin_')) {
+    const adminId = +state.split('_')[3];
+    const ticketId = activeReplies.get(adminId);
+    const ticketRepository = AppDataSource.getRepository(Ticket);
+
+    try {
+      const ticket = await ticketRepository.findOne({ where: { id: ticketId } });
+      if (ticket) {
+        await bot.telegram.sendMessage(adminId, `Ответ от пользователя ${ticket.messages[0].senderName} на тикет #${ticket.id}: ${ctx.message.text}`);
+
+        const newMessage = {
+          sender: 'user',
+          senderName: ctx.from.first_name,
+          text: ctx.message.text,
+          timestamp: new Date(),
+        };
+        
+        ticket.messages.push(newMessage);
+        ticket.updatedAt = new Date();
+        await ticketRepository.save(ticket);
+
+        await ctx.reply('Ваш ответ был отправлен.');
+        userStates.delete(ctx.from.id);
       } else {
         await ctx.reply('Тикет не найден.');
       }

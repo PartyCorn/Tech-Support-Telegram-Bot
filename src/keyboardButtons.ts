@@ -13,5 +13,7 @@ export const createTicketButtons = (ticketId: number) => {
     Markup.button.callback('Ответить', `reply_ticket_${ticketId}`),
     Markup.button.callback('Следующий тикет', `next_ticket_${ticketId}`),
     Markup.button.callback('Закрыть тикет', `close_ticket_${ticketId}`)
-  ], [Markup.button.callback('Отмена', 'cancel_ticket_view')]]);
+  ],
+  [Markup.button.callback('Скачать лог', `download_ticket_log_${ticketId}`)],
+  [Markup.button.callback('Отмена', 'cancel_ticket_view')]]);
 };
