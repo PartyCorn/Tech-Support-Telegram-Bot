@@ -1,8 +1,10 @@
-import { Telegraf, Markup } from 'telegraf';
-import { Between } from 'typeorm';
+import { Telegraf, Markup, Context } from 'telegraf';
+import { Update } from 'telegraf/typings/core/types/typegram';
+import { Between, Not, In } from 'typeorm';
 import { initializeDatabase, AppDataSource } from './database';
 import { Admin } from './models/Admin';
 import { Ticket } from './models/Ticket';
+import { BlackList } from './models/BlackList';
 import { getCategoryKeyboard, createTicketButtons } from './keyboardButtons';
 
 const bot = new Telegraf('<YOUR_BOT_TOKEN_HERE>');
@@ -15,6 +17,7 @@ const notificationInterval = 1 * 60 * 60 * 1000; // Интервал уведо�
 const notificationThreshold = 10; // Количество тикетов для немедленного уведомления
 const notificationWindow = 30 * 60 * 1000; // Временное окно для отслеживания тикетов в миллисекундах (например, 30 минут)
 const maximumTicketsPerUser = 2; // Количество активныв тикетов на одного пользователя
+const USERS_PER_PAGE = 20; // Количество пользователей, которые нужно вывести на 1 страницу (для чёрного списка)
 
 let ticketTimestamps: number[] = []; // Массив для хранения временных меток новых тикетов
 const activeReplies = new Map<number, number>(); // Храним ID администратора и тикет
@@ -26,7 +29,7 @@ function formatTicketMessage(ticket: Ticket): string {
     (msg) => `${new Date(msg.timestamp).toLocaleString('ru-RU')}\n${(msg.sender === 'admin' ? 'Администратор' : 'Пользователь') + ` (${msg.senderName}):`}\n${msg.text}\n`
   ).join('\n');
 
-  return `Тикет #${ticket.id}\nКатегория: ${ticket.category}\nСообщения:\n\n${formattedMessages}`;
+  return `Тикет #${ticket.id} (${ticket.userId})\nКатегория: ${ticket.category}\nСообщения:\n\n${formattedMessages}`;
 }
 
 function formatTicketLog(ticket: Ticket) {
@@ -89,27 +92,56 @@ bot.start(async (ctx) => {
   await ctx.reply(isAdmin ? 'Список тикетов' : `Добро пожаловать в поддержку ${appName}! Выберите категорию, чтобы создать обращение (максимум ${maximumTicketsPerUser}):`, getCategoryKeyboard());
 });
 
+// Функция для получения активных тикетов от незаблокированных пользователей
+async function getActiveTicketsExcludingBlacklistedUsers(category: string) {
+  const ticketRepository = AppDataSource.getRepository(Ticket);
+  const blackListRepository = AppDataSource.getRepository(BlackList);
+
+  const blacklistedUsers = await blackListRepository.find();
+  const blacklistedUserIds = blacklistedUsers.map(user => user.userId);
+
+  const tickets = await ticketRepository.find({
+    where: {
+      category,
+      status: 'active',
+      userId: Not(In(blacklistedUserIds)) // Исключаем тикеты юзеров, находящихся в ЧС
+    },
+    order: { createdAt: 'ASC' }
+  });
+
+  return tickets;
+}
+
+// Функция для отправки сообщения с тикетом
+async function sendTicketMessage(ctx: Context<Update>, ticket: Ticket) {
+  const text = formatTicketMessage(ticket);
+  if (text.length < 4096) {
+    await ctx.reply(text, createTicketButtons(ticket.id));
+  } else {
+    await ctx.reply('Сообщение слишком длинное. Пожалуйста, скачайте лог файла.', createTicketButtons(ticket.id));
+  }
+}
+
+// Обработчик команды для администратора (и немного для юзера)
 bot.hears(['Идеи и предложения', 'Сообщить об ошибке', 'Общие вопросы'], async (ctx) => {
   const category = ctx.message.text;
   const adminRepository = AppDataSource.getRepository(Admin);
   const isAdmin = await adminRepository.findOne({ where: { adminId: ctx.from.id.toString() } });
 
   if (isAdmin) {
-    const ticketRepository = AppDataSource.getRepository(Ticket);
-    const tickets = await ticketRepository.find({ where: { category, status: 'active' }, order: { createdAt: 'ASC' } });
+    const tickets = await getActiveTicketsExcludingBlacklistedUsers(category);
 
     if (tickets.length > 0) {
       const ticket = tickets[0]; // Берем первый тикет
-      const text = formatTicketMessage(ticket);
-      await ctx.reply(text.length < 4096 ? text : 'Сообщение слишком длинное. Пожалуйста, скачайте лог файла.', createTicketButtons(ticket.id));
+      await sendTicketMessage(ctx, ticket);
     } else {
       await ctx.reply('Нет активных тикетов в этой категории.', getCategoryKeyboard());
     }
   } else {
     await ctx.reply(`Пожалуйста, опишите ваш запрос в категории "${category}":`);
     userStates.set(ctx.from.id, 'creating_ticket'); // Устанавливаем состояние для пользователя
-    userCategories.set(ctx.from.id, category); // Сохраняем категорию
   }
+  userCategories.set(ctx.from.id, category); // Сохраняем категорию
 });
 
 bot.action(/download_ticket_log_(\d+)/, async (ctx) => {
@@ -184,18 +216,19 @@ bot.action(/cancel_reply_(\d+)/, async (ctx) => {
   await ctx.answerCbQuery();
 });
 
+// Обработчик действия для показа следующего тикета
 bot.action(/next_ticket_(\d+)/, async (ctx) => {
   const currentTicketId = parseInt(ctx.match[1], 10);
-  const ticketRepository = AppDataSource.getRepository(Ticket);
 
   try {
-    const tickets = await ticketRepository.find({ where: { status: 'active' }, order: { createdAt: 'ASC' } });
+    const category = userCategories.get(ctx.from.id);
+    if (!category) return;
+    const tickets = await getActiveTicketsExcludingBlacklistedUsers(category); // Не указываем категорию, чтобы получить все тикеты
     const currentTicketIndex = tickets.findIndex(ticket => ticket.id === currentTicketId);
-    
+
     if (currentTicketIndex >= 0 && currentTicketIndex < tickets.length - 1) {
       const nextTicket = tickets[currentTicketIndex + 1];
-      const text = formatTicketMessage(nextTicket);
-      await ctx.editMessageText(text.length < 4096 ? text : 'Сообщение слишком длинное. Пожалуйста, скачайте лог файла.', createTicketButtons(nextTicket.id));
+      await sendTicketMessage(ctx, nextTicket);
     } else {
       await ctx.reply('Нет больше тикетов.', getCategoryKeyboard());
     }
@@ -222,6 +255,179 @@ bot.action('cancel_ticket_view', async (ctx) => {
   await ctx.answerCbQuery();
 });
 
+// Реализация Чёрного Списка
+function escapeMarkdown(text: string): string {
+  const markdownChars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
+
+  return text.split('').map(char => {
+    if (markdownChars.includes(char)) {
+      return `\\${char}`; // экранирование символа
+    }
+    return char;
+  }).join('');
+}
+
+const getBlacklistedUsers = async (page: number = 1) => {
+  const blacklistRepository = AppDataSource.getRepository(BlackList);
+  const [users, total] = await blacklistRepository.findAndCount({
+    order: { blockedAt: 'ASC' },
+    skip: (page - 1) * USERS_PER_PAGE,
+    take: USERS_PER_PAGE,
+  });
+
+  return { users, total };
+};
+
+const createPaginationButtons = (page: number, totalPages: number) => {
+  const buttons = [];
+
+  if (page > 1) {
+    buttons.push(Markup.button.callback('⬅️ Назад', `blacklist_page_${page - 1}`));
+  }
+
+  buttons.push(Markup.button.callback(`Страница ${page}/${totalPages}`, 'noop'));
+
+  if (page < totalPages) {
+    buttons.push(Markup.button.callback('Вперед ➡️', `blacklist_page_${page + 1}`));
+  }
+
+  return buttons;
+};
+
+const formatBlacklistedUsers = (users: BlackList[], total: number, page: number, totalPages: number) => {
+  let message = `*Черный список* _\\(${getDeclension(total, 'запись', 'записи', 'записей')}\\)_\n\n`;
+
+  users.forEach(user => {
+    message += `${user.id}: ${user.publicName}, \`${user.userId}\`\n${user.blockedBy} в ${escapeMarkdown(new Date(user.blockedAt).toLocaleString('ru-RU'))}\nПричина: ${user.reason}\n\n`;
+  });
+
+  if (users) message += 'Действия: /block \\| /unblock'
+
+  return message.trim();
+};
+
+bot.command('blacklist', async (ctx) => {
+  const adminRepository = AppDataSource.getRepository(Admin);
+  const admin = await adminRepository.findOne({ where: { adminId: ctx.from.id.toString() } });
+
+  if (!admin) {
+    return;
+  }
+
+  const page = 1; // Стартовая страница
+  const { users, total } = await getBlacklistedUsers(page);
+  const totalPages = Math.ceil(total / USERS_PER_PAGE);
+
+  const message = formatBlacklistedUsers(users, total, page, totalPages);
+
+  await ctx.replyWithMarkdownV2(message, Markup.inlineKeyboard(createPaginationButtons(page, totalPages)));
+});
+
+bot.action(/blacklist_page_(\d+)/, async (ctx) => {
+  const page = parseInt(ctx.match[1], 10);
+  const { users, total } = await getBlacklistedUsers(page);
+  const totalPages = Math.ceil(total / USERS_PER_PAGE);
+
+  const message = formatBlacklistedUsers(users, total, page, totalPages);
+
+  await ctx.editMessageText(message, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard(createPaginationButtons(page, totalPages))
+  });
+  await ctx.answerCbQuery();
+});
+
+bot.command('block', async (ctx) => {
+  const messageParts = ctx.message.text.split(' '); 
+  const userId = messageParts[1];
+  const reason = messageParts.slice(2).join(' ');
+
+  const adminRepository = AppDataSource.getRepository(Admin);
+  const admin = await adminRepository.findOne({ where: { adminId: ctx.from.id.toString() } });
+
+  if (!admin) {
+    return;
+  }
+
+  if (!userId || !reason) {
+    return ctx.reply('Пожалуйста, укажите userId и причину блокировки. Формат: /block 1234567890 Причина (пробелы включены)');
+  }
+
+  const blacklistRepository = AppDataSource.getRepository(BlackList);
+  const ticketRepository = AppDataSource.getRepository(Ticket);
+  
+  // Проверка на наличие пользователя в черном списке
+  const existingUser = await blacklistRepository.findOne({ where: { userId } });
+  if (existingUser) {
+    return ctx.replyWithMarkdownV2(`Пользователь уже находится в черном списке\\. Чтобы разблокировать: \`/unblock ${userId}\``);
+  }
+
+  try {
+    const ticket = await ticketRepository.findOne({ where: { userId: userId } })
+    const publicName = ticket ? ticket.messages[0].senderName : 'unknown';
+    
+    const newBlackListEntry = new BlackList();
+    newBlackListEntry.userId = userId;
+    newBlackListEntry.publicName = escapeMarkdown(publicName);
+    newBlackListEntry.reason = escapeMarkdown(reason);
+    newBlackListEntry.blockedBy = escapeMarkdown(ctx.from.first_name);
+    newBlackListEntry.blockedAt = new Date();
+
+    await blacklistRepository.save(newBlackListEntry);
+
+    await ctx.replyWithMarkdownV2(`Пользователь ${publicName} \\(${userId}\\) был добавлен в черный список\\.\nПричина: ${newBlackListEntry.reason}`);
+  } catch (error) {
+    console.error(error);
+    await ctx.reply('Не удалось добавить пользователя в черный список. Проверьте правильность userId.');
+  }
+});
+
+bot.command('unblock', async (ctx) => {
+  const messageParts = ctx.message.text.split(' '); 
+  const userId = messageParts[1];
+
+  const adminRepository = AppDataSource.getRepository(Admin);
+  const admin = await adminRepository.findOne({ where: { adminId: ctx.from.id.toString() } });
+
+  if (!admin) {
+    return;
+  }
+
+  if (!userId) {
+    return ctx.reply('Пожалуйста, укажите userId для удаления из черного списка. Формат: /unblock 1234567890');
+  }
+
+  const blacklistRepository = AppDataSource.getRepository(BlackList);
+  
+  // Поиск пользователя в черном списке
+  const blacklistedUser = await blacklistRepository.findOne({ where: { userId } });
+
+  if (!blacklistedUser) {
+    return ctx.reply('Пользователь не найден в черном списке.');
+  }
+
+  try {
+    await blacklistRepository.remove(blacklistedUser);
+    await ctx.replyWithMarkdownV2(`Пользователь ${blacklistedUser.publicName} \\(${userId}\\) был удален из черного списка\\.`);
+  } catch (error) {
+    console.error(error);
+    await ctx.reply('Произошла ошибка при удалении пользователя из черного списка.');
+  }
+});
+
+// Заглушка для кнопки "Страница x/y"
+bot.action('noop', async (ctx) => {
+  await ctx.answerCbQuery();
+});
+
+async function isUserBlacklisted(userId: string): Promise<boolean> {
+  const blackListRepository = AppDataSource.getRepository(BlackList);
+  
+  const userInBlackList = await blackListRepository.findOne({ where: { userId } });
+  return !!userInBlackList; // Вернёт true, если пользователь найден в ЧС
+}
+
+// Продолжение Кода
 bot.on('text', async (ctx) => {
   const state = userStates.get(ctx.from.id);
 
@@ -243,6 +449,11 @@ bot.on('text', async (ctx) => {
 
     if (activeTickets >= maximumTicketsPerUser) {
       await ctx.reply(`У вас уже есть ${maximumTicketsPerUser} активных тикета. Пожалуйста, дождитесь их обработки.`);
+      return;
+    }
+
+    if (await isUserBlacklisted(userId)) {
+      await ctx.reply('Вы находитесь в черном списке и не можете создавать тикеты.');
       return;
     }
 
